@@ -12,6 +12,19 @@ Click the icon and a **dropdown lists the sessions waiting on you** by name.
   already allowed to read. No Accessibility, no Automation, no window control.
 - **Local only.** No network. Everything is local files + kqueue watches.
 
+## Quick install (macOS)
+
+```sh
+git clone https://github.com/Humble-Coders/claude-beacon.git && cd claude-beacon && ./install.sh
+```
+
+That's it — it builds the app locally and wires up the Claude Code hooks. You
+need a Mac with **Xcode Command Line Tools** (`xcode-select --install`) and
+**Homebrew** (for `jq`); the installer checks for these and does the rest.
+
+> Restart any already-open **terminal** Claude sessions (or run `/hooks`) so they
+> pick up the hooks. The desktop app needs no restart.
+
 ```
 Terminal Claude Code                     Claude desktop app
    │  hooks: SessionStart, Notification,    │  hooks: SessionStart, PreToolUse,
