@@ -1,0 +1,10 @@
+# Swift build artifacts
+app/.build/
+app/.swiftpm/
+*.xcodeproj
+
+# macOS
+.DS_Store
+
+# Local runtime data (never part of the source)
+*.beacon-bak

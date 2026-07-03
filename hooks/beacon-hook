@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# beacon-hook — Claude Beacon event emitter.
+#
+# Fires from Claude Code hooks. Reads the hook JSON payload on stdin, captures
+# host context (tty, terminal identity, process ancestry, cwd), and writes ONE
+# atomic JSON event file into ~/.claude-beacon/events/ which the menu bar app
+# watches with a kqueue DispatchSource.
+#
+# Hard requirements: fast (<50ms), never blocks Claude Code, ALWAYS exit 0.
+# Only hard dependency is `jq`. A crash here must never break a session, so the
+# whole body runs guarded and the script exits 0 no matter what.
+#
+# Subcommands: register | pending | attended | ended | dump-env
+
+BEACON_HOME="${CLAUDE_BEACON_HOME:-$HOME/.claude-beacon}"
+EVENTS_DIR="$BEACON_HOME/events"
+LOG_FILE="$BEACON_HOME/beacon.log"
+
+log() {
+  # Best-effort append; never fail the hook because logging failed.
+  printf '%s [hook] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# epoch milliseconds. BSD/macOS `date` lacks %N, so prefer perl (always present
+# on macOS) for true millisecond resolution, then gdate, then coarse fallback.
+# Real ms matter: the app orders events by ts, and a pending+attended pair can
+# land in the same wall-clock second.
+epoch_ms() {
+  local ms
+  ms=$(perl -MTime::HiRes=time -e 'printf("%d", time()*1000)' 2>/dev/null)
+  if [ -n "$ms" ]; then echo "$ms"; return; fi
+  ms=$(gdate +%s%3N 2>/dev/null)
+  case "$ms" in
+    ''|*[!0-9]*) echo "$(( $(date +%s) * 1000 ))" ;;
+    *)           echo "$ms" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Host context capture
+# ---------------------------------------------------------------------------
+
+# Walk up the process ancestry (max 6 hops) starting at $PPID to find the
+# controlling `claude` process and/or a real controlling TTY. The hook always
+# runs as a descendant of the claude process.
+#   Sets globals: CLAUDE_PID, TTY_NORM
+resolve_ancestry() {
+  CLAUDE_PID=""
+  TTY_NORM=""
+  local pid="${PPID:-0}"
+  local hop ppid tty comm
+  for hop in 1 2 3 4 5 6; do
+    [ -z "$pid" ] && break
+    [ "$pid" = "0" ] && break
+    # ps output: "  <ppid> <tty> <comm...>"
+    local line
+    line=$(ps -o ppid=,tty=,comm= -p "$pid" 2>/dev/null)
+    [ -z "$line" ] && break
+    ppid=$(echo "$line" | awk '{print $1}')
+    tty=$(echo "$line"  | awk '{print $2}')
+    # comm may contain spaces/paths; take everything after the 2nd field.
+    comm=$(echo "$line" | awk '{$1=""; $2=""; print}' | sed 's/^ *//')
+
+    # First real tty we encounter wins.
+    if [ -z "$TTY_NORM" ] && [ -n "$tty" ] && [ "$tty" != "??" ] && [ "$tty" != "?" ]; then
+      case "$tty" in
+        /dev/*) TTY_NORM="$tty" ;;
+        *)      TTY_NORM="/dev/$tty" ;;
+      esac
+    fi
+
+    # First ancestor whose comm looks like claude wins.
+    if [ -z "$CLAUDE_PID" ]; then
+      case "$comm" in
+        *[Cc]laude*|*claude*) CLAUDE_PID="$pid" ;;
+      esac
+    fi
+
+    # Stop early once we have both.
+    [ -n "$CLAUDE_PID" ] && [ -n "$TTY_NORM" ] && break
+    pid="$ppid"
+  done
+  # Fall back to PPID for claude_pid if nothing matched.
+  [ -z "$CLAUDE_PID" ] && CLAUDE_PID="${PPID:-0}"
+}
+
+# Classify the host into a stable host_type string.
+#   Uses: TERM_PROGRAM, ITERM_SESSION_ID, WEZTERM_PANE, KITTY_WINDOW_ID,
+#         TMUX, VSCODE_INJECTION, and TTY_NORM (must be resolved first).
+#   Sets global: HOST_TYPE
+classify_host() {
+  local inner="unknown_terminal"
+  local tp="${TERM_PROGRAM:-}"
+
+  if [ -n "$WEZTERM_PANE" ]; then
+    inner="wezterm"
+  elif [ -n "$KITTY_WINDOW_ID" ] || [ "$tp" = "kitty" ] || [ "${TERM:-}" = "xterm-kitty" ]; then
+    inner="kitty"
+  elif [ "$tp" = "vscode" ] || [ -n "$VSCODE_INJECTION" ] || [ -n "$VSCODE_GIT_IPC_HANDLE" ]; then
+    inner="vscode"
+  elif [ "$tp" = "iTerm.app" ] || [ -n "$ITERM_SESSION_ID" ]; then
+    inner="iterm2"
+  elif [ "$tp" = "Apple_Terminal" ]; then
+    inner="apple_terminal"
+  elif [ "${__CFBundleIdentifier:-}" = "com.anthropic.claudefordesktop" ] || { [ -z "$tp" ] && [ -z "$TTY_NORM" ]; }; then
+    # Claude desktop app: sets __CFBundleIdentifier and provides no terminal
+    # identity nor controlling tty (verified via dump-env inside the app).
+    inner="claude_desktop"
+  else
+    inner="unknown_terminal"
+  fi
+
+  if [ -n "$TMUX" ]; then
+    HOST_TYPE="tmux+$inner"
+  else
+    HOST_TYPE="$inner"
+  fi
+}
+
+# Extract the iTerm2 session UUID from ITERM_SESSION_ID ("w0t2p0:UUID").
+iterm_uuid() {
+  case "${ITERM_SESSION_ID:-}" in
+    *:*) echo "${ITERM_SESSION_ID#*:}" ;;
+    *)   echo "" ;;
+  esac
+}
+
+# Emit the "host" JSON object using jq (safe escaping).
+host_json() {
+  jq -cn \
+    --arg host_type   "$HOST_TYPE" \
+    --arg tty         "$TTY_NORM" \
+    --argjson pid     "${CLAUDE_PID:-0}" \
+    --arg term_program "${TERM_PROGRAM:-}" \
+    --arg tpver       "${TERM_PROGRAM_VERSION:-}" \
+    --arg iterm_uuid  "$(iterm_uuid)" \
+    --arg term_session_id "${TERM_SESSION_ID:-}" \
+    --arg tmux_pane   "${TMUX_PANE:-}" \
+    --arg wezterm_pane "${WEZTERM_PANE:-}" \
+    --arg kitty_id    "${KITTY_WINDOW_ID:-}" \
+    '{
+      host_type: $host_type,
+      tty: (if $tty == "" then null else $tty end),
+      claude_pid: $pid,
+      term_program: (if $term_program == "" then null else $term_program end),
+      term_program_version: (if $tpver == "" then null else $tpver end),
+      iterm_session_uuid: (if $iterm_uuid == "" then null else $iterm_uuid end),
+      term_session_id: (if $term_session_id == "" then null else $term_session_id end),
+      tmux_pane: (if $tmux_pane == "" then null else $tmux_pane end),
+      wezterm_pane: (if $wezterm_pane == "" then null else $wezterm_pane end),
+      kitty_window_id: (if $kitty_id == "" then null else $kitty_id end)
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# Event writing
+# ---------------------------------------------------------------------------
+
+# write_event <type>  — reads the hook stdin payload (already in $PAYLOAD),
+# resolves context, and atomically writes an event file.
+write_event() {
+  local type="$1"
+  mkdir -p "$EVENTS_DIR" 2>/dev/null
+
+  resolve_ancestry
+  classify_host
+
+  local ts session_id cwd project notif_type message host
+  ts=$(epoch_ms)
+  session_id=$(echo "$PAYLOAD" | jq -r '.session_id // ""' 2>/dev/null)
+  cwd=$(echo "$PAYLOAD"        | jq -r '.cwd // ""' 2>/dev/null)
+  [ -z "$cwd" ] && cwd="$PWD"
+  project=$(basename "$cwd" 2>/dev/null)
+  notif_type=$(echo "$PAYLOAD" | jq -r '.notification_type // ""' 2>/dev/null)
+  message=$(echo "$PAYLOAD"    | jq -r '.message // ""' 2>/dev/null)
+  # Callers (e.g. `stopped`) may inject a synthetic type/message for events that
+  # don't carry one in the payload.
+  [ -n "$NOTIF_OVERRIDE" ] && notif_type="$NOTIF_OVERRIDE"
+  [ -n "$MSG_OVERRIDE" ]   && message="$MSG_OVERRIDE"
+  host=$(host_json)
+
+  local event
+  event=$(jq -cn \
+    --argjson v 1 \
+    --arg type "$type" \
+    --argjson ts "$ts" \
+    --arg session_id "$session_id" \
+    --arg cwd "$cwd" \
+    --arg project "$project" \
+    --arg notif_type "$notif_type" \
+    --arg message "$message" \
+    --argjson host "$host" \
+    '{
+      v: $v, type: $type, ts: $ts,
+      session_id: $session_id, cwd: $cwd, project: $project,
+      notification_type: (if $notif_type == "" then null else $notif_type end),
+      message: (if $message == "" then null else $message end),
+      host: $host
+    }' 2>/dev/null)
+
+  if [ -z "$event" ]; then
+    log "failed to build event json for type=$type"
+    return 0
+  fi
+
+  # Atomic write: temp file in the SAME dir, then mv.
+  local final tmp
+  final="$EVENTS_DIR/${ts}-$$.json"
+  tmp="$EVENTS_DIR/.tmp-${ts}-$$.json"
+  printf '%s' "$event" >"$tmp" 2>/dev/null && mv -f "$tmp" "$final" 2>/dev/null
+  log "wrote $type event session=${session_id:0:8} host=$HOST_TYPE tty=${TTY_NORM:-none} -> $(basename "$final")"
+}
+
+# ---------------------------------------------------------------------------
+# dump-env (debug / future host support)
+# ---------------------------------------------------------------------------
+dump_env() {
+  resolve_ancestry
+  classify_host
+  echo "===== beacon-hook dump-env ====="
+  echo "-- resolved context --"
+  echo "HOST_TYPE   = $HOST_TYPE"
+  echo "CLAUDE_PID  = ${CLAUDE_PID:-}"
+  echo "TTY_NORM    = ${TTY_NORM:-<none>}"
+  echo "ITERM_UUID  = $(iterm_uuid)"
+  echo "PWD         = $PWD"
+  echo "-- relevant env vars --"
+  env | grep -iE '^(TERM_PROGRAM|TERM_PROGRAM_VERSION|TERM_SESSION_ID|ITERM_SESSION_ID|ITERM_PROFILE|WEZTERM_PANE|WEZTERM_UNIX_SOCKET|KITTY_WINDOW_ID|TMUX|TMUX_PANE|VSCODE_INJECTION|VSCODE_GIT_IPC_HANDLE|TERM|__CFBundleIdentifier)=' | sort
+  echo "-- __CFBundleIdentifier (host app bundle id, if any) --"
+  echo "${__CFBundleIdentifier:-<unset>}"
+  echo "-- process ancestry --"
+  local pid="${PPID:-0}" hop line
+  for hop in 1 2 3 4 5 6; do
+    [ -z "$pid" ] && break; [ "$pid" = "0" ] && break
+    line=$(ps -o pid=,ppid=,tty=,comm= -p "$pid" 2>/dev/null)
+    [ -z "$line" ] && break
+    echo "  $line"
+    pid=$(echo "$line" | awk '{print $2}')
+  done
+  echo "-- if hook received stdin payload --"
+  echo "${PAYLOAD:-<no stdin>}"
+  echo "================================"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-}"
+  # Read stdin payload if present (non-blocking-ish; hooks always pipe JSON).
+  PAYLOAD=""
+  if [ ! -t 0 ]; then
+    PAYLOAD=$(cat 2>/dev/null)
+  fi
+
+  NOTIF_OVERRIDE=""
+  MSG_OVERRIDE=""
+
+  case "$cmd" in
+    register) write_event "register" ;;
+    pending)  write_event "pending"  ;;
+    attended) write_event "attended" ;;
+    ended)    write_event "ended"    ;;
+    stopped)
+      # Fired on Stop (turn finished) on every surface. A finished turn means
+      # "Claude is done and waiting for you" — surface it as a pending alert for
+      # terminals and the desktop app alike. (The desktop app never fires the
+      # Notification hook, so for it this is also the only "waiting" signal.)
+      NOTIF_OVERRIDE="turn_complete"
+      MSG_OVERRIDE="Claude finished — waiting for you"
+      write_event "pending"
+      ;;
+    dump-env) dump_env ;;
+    *)
+      log "unknown subcommand: '$cmd'"
+      echo "usage: beacon-hook {register|pending|attended|stopped|ended|dump-env}" >&2
+      ;;
+  esac
+  return 0
+}
+
+# Guard the whole thing: any error still exits 0.
+main "$@" 2>>"$LOG_FILE"
+exit 0
