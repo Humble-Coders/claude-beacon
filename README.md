@@ -176,9 +176,15 @@ it's ever too chatty.
   reads are offset-guarded so nothing is processed twice.
 - **No double alerts** — desktop prompts are de-duplicated by request id (the app
   logs each line twice), so a prompt chimes once, not twice.
-- **No stuck light** — `attended` / logged responses / `SessionEnd` clear state;
-  a 30 s PID-liveness sweep evicts crashed sessions (`kill(pid, 0)`); a 12 h TTL
-  is the final backstop.
+- **No stuck light** — a desktop prompt clears on its logged **response** *or* its
+  **`aborted`** line (interrupted / cancelled / superseded prompts end with the
+  latter). As a self-heal for any missed line (log rotation, restart, crash), a
+  finished turn (`Stop`) and app startup both drop any still-open request — safe
+  because a genuinely pending permission blocks the turn. `SessionEnd` +
+  a 30 s PID-liveness sweep (`kill(pid, 0)`) + a 12 h TTL are the final backstops.
+- **Right chime for the right event** — because a stale open request can no longer
+  linger, a finished turn always rings as the calm "done" ding, never the
+  attention chime.
 - **Never blocks Claude Code** — the hook is async, sub-50 ms, and always
   exits 0; a hook crash can't break a session.
 

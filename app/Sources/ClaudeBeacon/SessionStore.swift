@@ -217,6 +217,14 @@ final class SessionStore {
             s.pendingSince = s.pendingSince ?? now
             s.lastEventTS = e.ts
             if e.notification_type == "turn_complete" {
+                // The turn is over, so any desktop permission still marked "open"
+                // is stale — its response/abort log line was missed (rotation,
+                // restart, crash). Clear it, so this rings as a calm "done" ding
+                // instead of a stuck red attention alert. This is safe: a
+                // genuinely pending permission blocks the turn, so Stop cannot
+                // fire while one is truly open. (We deliberately do NOT clear on
+                // `attended` — PreToolUse fires mid-prompt, before you answer.)
+                s.openRequests.removeAll()
                 // A finished turn is a transient, self-clearing notification.
                 s.doneExpiresAt = now.addingTimeInterval(Self.doneLinger)
                 newAlert = s.isDonePending   // false for stale replayed events
@@ -372,7 +380,15 @@ final class SessionStore {
         guard let data = try? Data(contentsOf: BeaconPaths.state) else { return }
         do {
             let snapshot = try JSONDecoder().decode([Session].self, from: data)
-            for s in snapshot { sessions[s.sessionID] = s }
+            for var s in snapshot {
+                // Desktop permission prompts don't survive a restart: any that
+                // were "open" when we last ran have almost certainly been answered
+                // during the downtime (and the desktop app still shows any that
+                // haven't). Carrying them over is the main way a stuck red light
+                // happens, so drop them on load.
+                s.openRequests.removeAll()
+                sessions[s.sessionID] = s
+            }
             Log.write("loaded \(snapshot.count) session(s) from state.json")
         } catch {
             // Schema change or corruption — start fresh; sessions repopulate as

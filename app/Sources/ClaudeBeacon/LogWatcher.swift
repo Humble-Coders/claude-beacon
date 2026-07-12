@@ -34,9 +34,14 @@ final class LogWatcher {
     // "Emitted tool permission request <reqID> for <Tool> in session local_<uuid>"
     private let emitRE = try! NSRegularExpression(
         pattern: #"Emitted tool permission request ([0-9a-fA-F-]{8,}) for (\S+) in session (local_[0-9a-fA-F-]+)"#)
-    // "Received permission response for <reqID>:"
+    // "Received permission response for <reqID>:" — the user answered.
     private let respRE = try! NSRegularExpression(
         pattern: #"Received permission response for ([0-9a-fA-F-]{8,})"#)
+    // "Permission request <reqID> for <Tool> aborted" — cancelled / interrupted /
+    // superseded. Ends the request just like a response, but the app logs it
+    // differently; without this the request would leak and stay red forever.
+    private let abortRE = try! NSRegularExpression(
+        pattern: #"Permission request ([0-9a-fA-F-]{8,}) for \S+ aborted"#)
 
     init(store: SessionStore) {
         self.store = store
@@ -176,6 +181,14 @@ final class LogWatcher {
             let reqID = sub(line, m, 1)
             if !reqID.isEmpty, store.desktopResolve(reqID: reqID) {
                 Log.write("desktop prompt resolved: req=\(reqID.prefix(8))")
+            }
+            return
+        }
+
+        if let m = abortRE.firstMatch(in: line, range: range) {
+            let reqID = sub(line, m, 1)
+            if !reqID.isEmpty, store.desktopResolve(reqID: reqID) {
+                Log.write("desktop prompt aborted: req=\(reqID.prefix(8))")
             }
         }
     }
